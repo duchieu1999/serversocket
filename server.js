@@ -1,336 +1,821 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
+require('dotenv').config();
 
+// Khởi tạo ứng dụng Express và máy chủ HTTP
 const app = express();
-app.use(cors());
-
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: "*", // Trong production nên giới hạn nguồn cụ thể 
-    methods: ["GET", "POST"]
-  }
+
+// Khởi tạo máy chủ WebSocket
+const wss = new WebSocket.Server({ server });
+
+// Đường dẫn API đơn giản để kiểm tra xem máy chủ có hoạt động không
+app.get('/', (req, res) => {
+  res.send('Máy chủ game Hiếu Gà đang chạy!');
 });
 
-// Lưu trữ phòng và người chơi
-const rooms = {};
+// Lưu trữ thông tin phòng và người chơi
+const rooms = new Map();
+const players = new Map();
 
-io.on('connection', (socket) => {
-  console.log('Người chơi đã kết nối:', socket.id);
+// Hằng số game
+const GAME_DURATION = 120; // 2 phút
+const MIN_PLAYERS = 2;
+const MAX_PLAYERS = 5;
+const WORLD_SIZE = 4000; // 4000x4000 pixcel
+const SAFE_ZONE_START = 1000;
+const SAFE_ZONE_END = 300;
 
-  // Xử lý tạo phòng
-  socket.on('create_room', (data) => {
-    const roomCode = Math.random().toString(36).substring(2, 6).toUpperCase();
-    
-    // Tạo phòng mới
-    rooms[roomCode] = {
-      players: [],
-      owner: socket.id,
-      isPlaying: false
-    };
-    
-    // Thêm người chơi vào phòng
-    const player = {
-      ...data.player,
-      socketId: socket.id,
-      isOwner: true
-    };
-    
-    rooms[roomCode].players.push(player);
-    
-    // Tham gia socket vào phòng
-    socket.join(roomCode);
-    socket.roomCode = roomCode;
-    
-    // Gửi thông tin phòng cho người tạo
-    socket.emit('room_created', { roomCode });
-    
-    console.log(`Phòng ${roomCode} đã được tạo bởi ${player.nickname}`);
-  });
-
-  // Xử lý tham gia phòng
-  socket.on('join_room', (data) => {
-    const { roomCode, player } = data;
-    
-    if (!rooms[roomCode]) {
-      socket.emit('error', { message: 'Phòng không tồn tại!' });
-      return;
-    }
-    
-    if (rooms[roomCode].isPlaying) {
-      socket.emit('error', { message: 'Trận đấu đã bắt đầu!' });
-      return;
-    }
-    
-    if (rooms[roomCode].players.length >= 8) {
-      socket.emit('error', { message: 'Phòng đã đầy!' });
-      return;
-    }
-    
-    // Thêm người chơi vào phòng
-    const newPlayer = {
-      ...player,
-      socketId: socket.id,
-      isOwner: false
-    };
-    
-    rooms[roomCode].players.push(newPlayer);
-    
-    // Tham gia socket vào phòng
-    socket.join(roomCode);
-    socket.roomCode = roomCode;
-    
-    // Gửi thông tin phòng cho tất cả người chơi trong phòng
-    io.to(roomCode).emit('room_joined', {
-      roomCode,
-      players: rooms[roomCode].players
-    });
-    
-    console.log(`${newPlayer.nickname} đã tham gia phòng ${roomCode}`);
-  });
-
-  // Xử lý rời phòng
-  socket.on('leave_room', () => {
-    const roomCode = socket.roomCode;
-    
-    if (roomCode && rooms[roomCode]) {
-      // Xóa người chơi khỏi phòng
-      rooms[roomCode].players = rooms[roomCode].players.filter(p => p.socketId !== socket.id);
+// Xử lý kết nối WebSocket
+wss.on('connection', (ws) => {
+  console.log('Người chơi mới đã kết nối');
+  
+  // Gán ID cho kết nối mới
+  ws.id = uuidv4();
+  
+  // Xử lý tin nhắn từ client
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log(`Nhận tin nhắn: ${data.type} từ ${ws.id}`);
       
-      socket.leave(roomCode);
-      socket.roomCode = null;
-      
-      // Kiểm tra xem còn ai trong phòng không
-      if (rooms[roomCode].players.length === 0) {
-        delete rooms[roomCode];
-        console.log(`Phòng ${roomCode} đã bị xóa do không còn người chơi`);
-      } else {
-        // Nếu người rời đi là chủ phòng, chuyển quyền cho người tiếp theo
-        if (rooms[roomCode].owner === socket.id) {
-          rooms[roomCode].owner = rooms[roomCode].players[0].socketId;
-          rooms[roomCode].players[0].isOwner = true;
-        }
-        
-        // Cập nhật thông tin phòng cho những người còn lại
-        io.to(roomCode).emit('room_updated', {
-          players: rooms[roomCode].players
-        });
+      switch (data.type) {
+        case 'register':
+          handleRegister(ws, data);
+          break;
+        case 'create_room':
+          handleCreateRoom(ws, data);
+          break;
+        case 'join_room':
+          handleJoinRoom(ws, data);
+          break;
+        case 'leave_room':
+          handleLeaveRoom(ws);
+          break;
+        case 'toggle_ready':
+          handleToggleReady(ws, data);
+          break;
+        case 'start_game':
+          handleStartGame(ws);
+          break;
+        case 'move':
+          handlePlayerMove(ws, data);
+          break;
+        case 'collect':
+          handleCollect(ws, data);
+          break;
+        case 'action':
+          handleAction(ws, data);
+          break;
+        case 'player_dead':
+          handlePlayerDead(ws);
+          break;
       }
+    } catch (error) {
+      console.error('Lỗi xử lý tin nhắn:', error);
     }
   });
-
-  // Xử lý bắt đầu trò chơi
-  socket.on('start_game', () => {
-    const roomCode = socket.roomCode;
-    
-    if (!roomCode || !rooms[roomCode]) return;
-    
-    // Kiểm tra xem người gửi có phải chủ phòng không
-    if (rooms[roomCode].owner !== socket.id) return;
-    
-    rooms[roomCode].isPlaying = true;
-    
-    // Tạo vị trí ngẫu nhiên cho hoa
-    const flowers = Array(30).fill().map((_, i) => {
-      const flowerType = Math.floor(Math.random() * 4); // 0-3 tương ứng với 4 loại hoa
-      const angle = Math.random() * Math.PI * 2;
-      const distance = Math.random() * 400 * 0.9; // 400 là maxMapRadius mặc định
-      
-      return {
-        id: i,
-        x: Math.cos(angle) * distance,
-        y: Math.sin(angle) * distance,
-        type: {
-          color: ['#FF69B4', '#FF0000', '#FFFF00', '#800080'][flowerType],
-          points: [1, 2, 3, 5][flowerType],
-          radius: [15, 18, 20, 22][flowerType],
-          petals: [5, 8, 6, 10][flowerType]
-        }
-      };
-    });
-    
-    // Bắt đầu trò chơi
-    io.to(roomCode).emit('game_started', {
-      players: rooms[roomCode].players,
-      flowers: flowers,
-      mapRadius: 400, // Bán kính ban đầu
-      timeRemaining: 60 // Thời gian trò chơi
-    });
-    
-    console.log(`Trò chơi đã bắt đầu trong phòng ${roomCode}`);
-    
-    // Bắt đầu đếm ngược và cập nhật trạng thái trò chơi
-    let gameTime = 60;
-    let mapRadius = 400;
-    let gameFlowers = [...flowers];
-    
-    const gameInterval = setInterval(() => {
-      if (!rooms[roomCode]) {
-        clearInterval(gameInterval);
-        return;
-      }
-      
-      gameTime--;
-      
-      // Thu nhỏ bản đồ mỗi 10 giây
-      if (gameTime % 10 === 0 && mapRadius > 120) {
-        mapRadius -= 40;
-        
-        // Tạo thêm hoa mới
-        if (gameFlowers.length < 50) {
-          const newFlowers = Array(5).fill().map((_, i) => {
-            const flowerType = Math.floor(Math.random() * 4);
-            const angle = Math.random() * Math.PI * 2;
-            const distance = Math.random() * mapRadius * 0.9;
-            
-            return {
-              id: gameFlowers.length + i,
-              x: Math.cos(angle) * distance,
-              y: Math.sin(angle) * distance,
-              type: {
-                color: ['#FF69B4', '#FF0000', '#FFFF00', '#800080'][flowerType],
-                points: [1, 2, 3, 5][flowerType],
-                radius: [15, 18, 20, 22][flowerType],
-                petals: [5, 8, 6, 10][flowerType]
-              }
-            };
-          });
-          
-          gameFlowers = [...gameFlowers, ...newFlowers];
-        }
-      }
-      
-      // Cập nhật trạng thái trò chơi
-      io.to(roomCode).emit('game_update', {
-        players: rooms[roomCode].players,
-        flowers: gameFlowers,
-        mapRadius: mapRadius,
-        timeRemaining: gameTime
-      });
-      
-      // Kiểm tra kết thúc trò chơi
-      if (gameTime <= 0 || mapRadius <= 120) {
-        clearInterval(gameInterval);
-        
-        // Sắp xếp người chơi theo điểm số
-        const sortedPlayers = [...rooms[roomCode].players].sort((a, b) => b.score - a.score);
-        
-        // Gửi kết quả trò chơi
-        io.to(roomCode).emit('game_over', {
-          winners: sortedPlayers.slice(0, 3),
-          allPlayers: sortedPlayers
-        });
-        
-        // Đặt lại trạng thái phòng
-        if (rooms[roomCode]) {
-          rooms[roomCode].isPlaying = false;
-          rooms[roomCode].players.forEach(p => p.score = 0);
-        }
-        
-        console.log(`Trò chơi đã kết thúc trong phòng ${roomCode}`);
-      }
-    }, 1000);
-  });
-
-  // Xử lý di chuyển người chơi
-  socket.on('player_move', (data) => {
-    const roomCode = socket.roomCode;
-    
-    if (!roomCode || !rooms[roomCode] || !rooms[roomCode].isPlaying) return;
-    
-    // Cập nhật vị trí người chơi
-    const playerIndex = rooms[roomCode].players.findIndex(p => p.id === data.playerId);
-    
-    if (playerIndex !== -1) {
-      rooms[roomCode].players[playerIndex].x = data.x;
-      rooms[roomCode].players[playerIndex].y = data.y;
-      
-      // Kiểm tra va chạm với hoa
-      checkFlowerCollection(roomCode, rooms[roomCode].players[playerIndex]);
-    }
-  });
-
+  
   // Xử lý ngắt kết nối
-  socket.on('disconnect', () => {
-    console.log('Người chơi đã ngắt kết nối:', socket.id);
+  ws.on('close', () => {
+    console.log(`Người chơi ${ws.id} đã ngắt kết nối`);
     
     // Xử lý người chơi rời phòng khi ngắt kết nối
-    const roomCode = socket.roomCode;
+    handleLeaveRoom(ws);
     
-    if (roomCode && rooms[roomCode]) {
-      // Xóa người chơi khỏi phòng
-      rooms[roomCode].players = rooms[roomCode].players.filter(p => p.socketId !== socket.id);
-      
-      // Kiểm tra xem còn ai trong phòng không
-      if (rooms[roomCode].players.length === 0) {
-        delete rooms[roomCode];
-        console.log(`Phòng ${roomCode} đã bị xóa do không còn người chơi`);
-      } else {
-        // Nếu người rời đi là chủ phòng, chuyển quyền cho người tiếp theo
-        if (rooms[roomCode].owner === socket.id) {
-          rooms[roomCode].owner = rooms[roomCode].players[0].socketId;
-          rooms[roomCode].players[0].isOwner = true;
-        }
-        
-        // Cập nhật thông tin phòng cho những người còn lại
-        io.to(roomCode).emit('room_updated', {
-          players: rooms[roomCode].players
-        });
-      }
-    }
+    // Xóa người chơi khỏi danh sách
+    players.delete(ws.id);
   });
 });
 
-// Hàm kiểm tra va chạm với hoa
-function checkFlowerCollection(roomCode, player) {
-  if (!rooms[roomCode] || !rooms[roomCode].gameFlowers) return;
+// Xử lý đăng ký người chơi
+function handleRegister(ws, data) {
+  const playerId = data.sessionId || ws.id;
   
-  const playerRadius = 25;
+  // Lưu thông tin người chơi
+  players.set(ws.id, {
+    id: playerId,
+    name: data.name,
+    socket: ws,
+    room: null
+  });
   
-  rooms[roomCode].gameFlowers = rooms[roomCode].gameFlowers.filter(flower => {
-    const dx = player.x - flower.x;
-    const dy = player.y - flower.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
+  // Thông báo xác nhận đăng ký
+  ws.send(JSON.stringify({
+    type: 'registered',
+    playerId: playerId
+  }));
+}
+
+// Xử lý tạo phòng
+function handleCreateRoom(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player) {
+    sendError(ws, 'Player not registered');
+    return;
+  }
+  
+  // Tạo mã phòng ngẫu nhiên
+  const roomCode = generateRoomCode();
+  
+  // Tạo phòng mới
+  const room = {
+    code: roomCode,
+    host: ws.id,
+    players: [
+      {
+        id: player.id,
+        name: player.name,
+        ready: true, // Chủ phòng luôn sẵn sàng
+        socket: ws,
+        x: 0,
+        y: 0,
+        health: 100,
+        flowers: 0,
+        isDead: false
+      }
+    ],
+    gameState: 'waiting',
+    gameTimer: GAME_DURATION,
+    safeRadius: SAFE_ZONE_START,
+    entities: {
+      flowers: [],
+      powerups: [],
+      hearts: [],
+      obstacles: []
+    }
+  };
+  
+  // Lưu thông tin phòng
+  rooms.set(roomCode, room);
+  
+  // Cập nhật thông tin người chơi
+  player.room = roomCode;
+  
+  // Thông báo phòng đã được tạo
+  ws.send(JSON.stringify({
+    type: 'room_created',
+    roomCode: roomCode,
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      ready: p.ready
+    }))
+  }));
+}
+
+// Xử lý tham gia phòng
+function handleJoinRoom(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player) {
+    sendError(ws, 'Player not registered');
+    return;
+  }
+  
+  const roomCode = data.roomCode;
+  const room = rooms.get(roomCode);
+  
+  if (!room) {
+    sendError(ws, 'Room not found');
+    return;
+  }
+  
+  if (room.gameState !== 'waiting') {
+    sendError(ws, 'Game already started');
+    return;
+  }
+  
+  if (room.players.length >= MAX_PLAYERS) {
+    sendError(ws, 'Room is full');
+    return;
+  }
+  
+  // Kiểm tra xem người chơi đã ở trong phòng chưa
+  const existingPlayer = room.players.find(p => p.id === player.id);
+  if (existingPlayer) {
+    // Nếu đã ở trong phòng, cập nhật socket
+    existingPlayer.socket = ws;
+  } else {
+    // Thêm người chơi vào phòng
+    room.players.push({
+      id: player.id,
+      name: player.name,
+      ready: false,
+      socket: ws,
+      x: 0,
+      y: 0,
+      health: 100,
+      flowers: 0,
+      isDead: false
+    });
+  }
+  
+  // Cập nhật thông tin người chơi
+  player.room = roomCode;
+  
+  // Thông báo người chơi đã tham gia phòng
+  ws.send(JSON.stringify({
+    type: 'room_joined',
+    roomCode: roomCode,
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      ready: p.ready
+    }))
+  }));
+  
+  // Thông báo cho những người chơi khác
+  broadcastToRoom(room, {
+    type: 'player_joined',
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      ready: p.ready
+    }))
+  }, [ws.id]);
+}
+
+// Xử lý rời phòng
+function handleLeaveRoom(ws) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room) return;
+  
+  // Xóa người chơi khỏi phòng
+  const playerIndex = room.players.findIndex(p => p.id === player.id);
+  
+  if (playerIndex !== -1) {
+    room.players.splice(playerIndex, 1);
     
-    if (distance < playerRadius + flower.type.radius) {
-      // Thu thập hoa
-      player.score += flower.type.points;
+    // Thông báo cho những người chơi khác
+    broadcastToRoom(room, {
+      type: 'player_left',
+      playerId: player.id,
+      players: room.players.map(p => ({
+        id: p.id,
+        name: p.name,
+        ready: p.ready
+      }))
+    });
+    
+    // Nếu đây là chủ phòng, chuyển quyền chủ phòng cho người chơi kế tiếp
+    if (player.id === room.host && room.players.length > 0) {
+      room.host = room.players[0].id;
+    }
+    
+    // Nếu không còn người chơi, xóa phòng
+    if (room.players.length === 0) {
+      rooms.delete(player.room);
+    }
+    
+    // Cập nhật thông tin người chơi
+    player.room = null;
+  }
+}
+
+// Xử lý chuyển trạng thái sẵn sàng
+function handleToggleReady(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'waiting') return;
+  
+  // Tìm người chơi trong phòng
+  const roomPlayer = room.players.find(p => p.id === player.id);
+  
+  if (roomPlayer) {
+    roomPlayer.ready = data.ready;
+    
+    // Thông báo cho tất cả người chơi trong phòng
+    broadcastToRoom(room, {
+      type: 'player_ready',
+      playerId: player.id,
+      ready: roomPlayer.ready,
+      players: room.players.map(p => ({
+        id: p.id,
+        name: p.name,
+        ready: p.ready
+      }))
+    });
+  }
+}
+
+// Xử lý bắt đầu trò chơi
+function handleStartGame(ws) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'waiting') return;
+  
+  // Kiểm tra xem người gửi có phải là chủ phòng không
+  if (room.host !== player.id) {
+    sendError(ws, 'Only host can start the game');
+    return;
+  }
+  
+  // Kiểm tra xem có đủ người chơi không
+  if (room.players.length < MIN_PLAYERS) {
+    sendError(ws, 'Not enough players');
+    return;
+  }
+  
+  // Kiểm tra xem tất cả người chơi đã sẵn sàng chưa
+  const allReady = room.players.every(p => p.ready || p.id === room.host);
+  
+  if (!allReady) {
+    sendError(ws, 'Not all players are ready');
+    return;
+  }
+  
+  // Khởi tạo game
+  initializeGame(room);
+  
+  // Thông báo cho tất cả người chơi trong phòng
+  broadcastToRoom(room, {
+    type: 'game_starting',
+    gameState: getGameState(room)
+  });
+  
+  // Bắt đầu trò chơi
+  room.gameState = 'playing';
+  
+  // Bắt đầu bộ đếm thời gian
+  startGameTimer(room);
+}
+
+// Khởi tạo trò chơi
+function initializeGame(room) {
+  // Đặt lại thời gian
+  room.gameTimer = GAME_DURATION;
+  room.safeRadius = SAFE_ZONE_START;
+  
+  // Đặt vị trí cho người chơi
+  room.players.forEach((player, index) => {
+    const angle = (index / room.players.length) * Math.PI * 2;
+    player.x = Math.cos(angle) * 300;
+    player.y = Math.sin(angle) * 300;
+    player.health = 100;
+    player.flowers = 0;
+    player.isDead = false;
+  });
+  
+  // Tạo các đối tượng trong game
+  generateObstacles(room);
+  generateCollectibles(room);
+}
+
+// Tạo các chướng ngại vật
+function generateObstacles(room) {
+  room.entities.obstacles = [];
+  
+  // Tạo 40 chướng ngại vật ngẫu nhiên
+  for (let i = 0; i < 40; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.random() * 900 + 100;
+    const x = Math.cos(angle) * distance;
+    const y = Math.sin(angle) * distance;
+    
+    const types = ['tree', 'bush', 'rock'];
+    const type = types[Math.floor(Math.random() * types.length)];
+    
+    room.entities.obstacles.push({
+      id: `obstacle_${i}`,
+      x,
+      y,
+      type
+    });
+  }
+}
+
+// Tạo các vật phẩm có thể thu thập
+function generateCollectibles(room) {
+  room.entities.flowers = [];
+  room.entities.powerups = [];
+  room.entities.hearts = [];
+  
+  // Tạo 100 bông hoa
+  for (let i = 0; i < 100; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.random() * 900 + 100;
+    const x = Math.cos(angle) * distance;
+    const y = Math.sin(angle) * distance;
+    
+    room.entities.flowers.push({
+      id: `flower_${i}`,
+      x,
+      y,
+      collected: false
+    });
+  }
+  
+  // Tạo 10 powerup
+  for (let i = 0; i < 10; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.random() * 800 + 200;
+    const x = Math.cos(angle) * distance;
+    const y = Math.sin(angle) * distance;
+    
+    room.entities.powerups.push({
+      id: `powerup_${i}`,
+      x,
+      y,
+      collected: false
+    });
+  }
+  
+  // Tạo 5 trái tim
+  for (let i = 0; i < 5; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.random() * 800 + 200;
+    const x = Math.cos(angle) * distance;
+    const y = Math.sin(angle) * distance;
+    
+    room.entities.hearts.push({
+      id: `heart_${i}`,
+      x,
+      y,
+      collected: false
+    });
+  }
+}
+
+// Bắt đầu bộ đếm thời gian
+function startGameTimer(room) {
+  const gameInterval = setInterval(() => {
+    if (!rooms.has(room.code) || room.gameState !== 'playing') {
+      clearInterval(gameInterval);
+      return;
+    }
+    
+    // Giảm thời gian
+    room.gameTimer--;
+    
+    // Thu nhỏ vùng an toàn
+    room.safeRadius = Math.max(SAFE_ZONE_END, SAFE_ZONE_START - (SAFE_ZONE_START - SAFE_ZONE_END) * (1 - room.gameTimer / GAME_DURATION));
+    
+    // Thỉnh thoảng tạo thêm bông hoa mới
+    if (Math.random() < 0.05) {
+      const angle = Math.random() * Math.PI * 2;
+      const distance = Math.random() * room.safeRadius * 0.8;
+      const x = Math.cos(angle) * distance;
+      const y = Math.sin(angle) * distance;
       
-      // Sinh ra hoa mới sau một khoảng thời gian
-      setTimeout(() => {
-        if (rooms[roomCode] && rooms[roomCode].gameFlowers) {
-          const flowerType = Math.floor(Math.random() * 4);
-          const angle = Math.random() * Math.PI * 2;
-          const distance = Math.random() * rooms[roomCode].mapRadius * 0.9;
+      const flowerId = `flower_new_${Date.now()}`;
+      
+      room.entities.flowers.push({
+        id: flowerId,
+        x,
+        y,
+        collected: false
+      });
+    }
+    
+    // Gửi cập nhật trạng thái game
+    broadcastGameState(room);
+    
+    // Kiểm tra kết thúc game
+    if (room.gameTimer <= 0 || isGameOver(room)) {
+      endGame(room);
+      clearInterval(gameInterval);
+    }
+  }, 1000);
+}
+
+// Kiểm tra xem trò chơi đã kết thúc chưa
+function isGameOver(room) {
+  // Đếm số người chơi còn sống
+  const alivePlayers = room.players.filter(p => !p.isDead);
+  
+  // Trò chơi kết thúc khi chỉ còn 1 người chơi hoặc tất cả đều chết
+  return alivePlayers.length <= 1;
+}
+
+// Kết thúc trò chơi
+function endGame(room) {
+  room.gameState = 'ended';
+  
+  // Sắp xếp người chơi theo số hoa đã thu thập
+  const winners = [...room.players]
+    .filter(p => !p.isDead)
+    .sort((a, b) => b.flowers - a.flowers);
+  
+  // Thông báo kết quả cho tất cả người chơi
+  broadcastToRoom(room, {
+    type: 'game_over',
+    winners: winners.map(p => ({
+      id: p.id,
+      name: p.name,
+      flowers: p.flowers
+    }))
+  });
+  
+  // Đặt lại phòng sau một khoảng thời gian
+  setTimeout(() => {
+    if (rooms.has(room.code)) {
+      room.gameState = 'waiting';
+      room.gameTimer = GAME_DURATION;
+      room.safeRadius = SAFE_ZONE_START;
+      
+      // Đặt lại người chơi
+      room.players.forEach(p => {
+        p.ready = p.id === room.host;
+        p.health = 100;
+        p.flowers = 0;
+        p.isDead = false;
+      });
+    }
+  }, 10000);
+}
+
+// Xử lý di chuyển người chơi
+function handlePlayerMove(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'playing') return;
+  
+  // Tìm người chơi trong phòng
+  const roomPlayer = room.players.find(p => p.id === player.id);
+  
+  if (roomPlayer && !roomPlayer.isDead) {
+    // Cập nhật vị trí người chơi
+    roomPlayer.x += data.vx;
+    roomPlayer.y += data.vy;
+    
+    // Kiểm tra va chạm với chướng ngại vật
+    room.entities.obstacles.forEach(obstacle => {
+      const dx = roomPlayer.x - obstacle.x;
+      const dy = roomPlayer.y - obstacle.y;
+      const distance = Math.sqrt(dx * dx + dy * dy);
+      
+      if (distance < 40) {
+        // Đẩy người chơi ra xa chướng ngại vật
+        const pushFactor = 1;
+        roomPlayer.x += (dx / distance) * pushFactor;
+        roomPlayer.y += (dy / distance) * pushFactor;
+      }
+    });
+    
+    // Kiểm tra xem người chơi có ở ngoài vùng an toàn không
+    const distanceFromCenter = Math.sqrt(roomPlayer.x * roomPlayer.x + roomPlayer.y * roomPlayer.y);
+    
+    if (distanceFromCenter > room.safeRadius) {
+      // Người chơi nhận sát thương khi ở ngoài vùng an toàn
+      roomPlayer.health -= 0.5;
+      
+      // Kiểm tra xem người chơi có chết không
+      if (roomPlayer.health <= 0) {
+        roomPlayer.isDead = true;
+      }
+    }
+  }
+}
+
+// Xử lý thu thập vật phẩm
+function handleCollect(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'playing') return;
+  
+  // Tìm người chơi trong phòng
+  const roomPlayer = room.players.find(p => p.id === player.id);
+  
+  if (!roomPlayer || roomPlayer.isDead) return;
+  
+  // Tìm vật phẩm
+  let item;
+  let items;
+  
+  if (data.itemType === 'flower') {
+    items = room.entities.flowers;
+  } else if (data.itemType === 'powerup') {
+    items = room.entities.powerups;
+  } else if (data.itemType === 'heart') {
+    items = room.entities.hearts;
+  } else {
+    return;
+  }
+  
+  item = items.find(i => i.id === data.itemId && !i.collected);
+  
+  if (!item) return;
+  
+  // Kiểm tra khoảng cách
+  const dx = roomPlayer.x - item.x;
+  const dy = roomPlayer.y - item.y;
+  const distance = Math.sqrt(dx * dx + dy * dy);
+  
+  if (distance < 30) {
+    // Thu thập vật phẩm
+    item.collected = true;
+    
+    // Áp dụng hiệu ứng của vật phẩm
+    if (data.itemType === 'flower') {
+      roomPlayer.flowers += 1;
+    } else if (data.itemType === 'heart') {
+      roomPlayer.health = Math.min(100, roomPlayer.health + 30);
+    }
+    
+    // Thông báo cho tất cả người chơi
+    broadcastToRoom(room, {
+      type: 'item_collected',
+      itemType: data.itemType,
+      itemId: data.itemId,
+      playerId: player.id
+    });
+  }
+}
+
+// Xử lý hành động người chơi
+function handleAction(ws, data) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'playing') return;
+  
+  // Tìm người chơi trong phòng
+  const roomPlayer = room.players.find(p => p.id === player.id);
+  
+  if (!roomPlayer || roomPlayer.isDead) return;
+  
+  if (data.action === 'collect_flower') {
+    // Thu thập tất cả hoa ở gần
+    let collected = false;
+    
+    room.entities.flowers.forEach(flower => {
+      if (!flower.collected) {
+        const dx = roomPlayer.x - flower.x;
+        const dy = roomPlayer.y - flower.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        
+        if (distance < 100) {
+          flower.collected = true;
+          roomPlayer.flowers += 1;
+          collected = true;
           
-          rooms[roomCode].gameFlowers.push({
-            id: Date.now(),
-            x: Math.cos(angle) * distance,
-            y: Math.sin(angle) * distance,
-            type: {
-              color: ['#FF69B4', '#FF0000', '#FFFF00', '#800080'][flowerType],
-              points: [1, 2, 3, 5][flowerType],
-              radius: [15, 18, 20, 22][flowerType],
-              petals: [5, 8, 6, 10][flowerType]
-            }
+          // Thông báo cho tất cả người chơi
+          broadcastToRoom(room, {
+            type: 'item_collected',
+            itemType: 'flower',
+            itemId: flower.id,
+            playerId: player.id
           });
         }
-      }, 2000);
-      
-      return false;
-    }
-    return true;
+      }
+    });
+  }
+}
+
+// Xử lý người chơi chết
+function handlePlayerDead(ws) {
+  const player = players.get(ws.id);
+  
+  if (!player || !player.room) return;
+  
+  const room = rooms.get(player.room);
+  
+  if (!room || room.gameState !== 'playing') return;
+  
+  // Tìm người chơi trong phòng
+  const roomPlayer = room.players.find(p => p.id === player.id);
+  
+  if (!roomPlayer) return;
+  
+  // Đánh dấu người chơi đã chết
+  roomPlayer.isDead = true;
+  
+  // Thông báo cho tất cả người chơi
+  broadcastToRoom(room, {
+    type: 'player_dead',
+    playerId: player.id
+  });
+  
+  // Kiểm tra xem trò chơi đã kết thúc chưa
+  if (isGameOver(room)) {
+    endGame(room);
+  }
+}
+
+// Gửi cập nhật trạng thái game cho tất cả người chơi trong phòng
+function broadcastGameState(room) {
+  broadcastToRoom(room, {
+    type: 'game_state',
+    gameTimer: room.gameTimer,
+    safeRadius: room.safeRadius,
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      x: p.x,
+      y: p.y,
+      health: p.health,
+      flowers: p.flowers,
+      isDead: p.isDead
+    })),
+    entities: getEntitiesUpdate(room)
   });
 }
 
-// Đường dẫn API đơn giản để kiểm tra máy chủ hoạt động
-app.get('/', (req, res) => {
-  res.send('Socket.IO server for Flower Collection Game is running!');
-});
+// Lấy cập nhật về các đối tượng trong game
+function getEntitiesUpdate(room) {
+  return [
+    ...room.entities.flowers.filter(f => !f.collected).map(f => ({
+      id: f.id,
+      type: 'flower',
+      x: f.x,
+      y: f.y,
+      collected: f.collected
+    })),
+    ...room.entities.powerups.filter(p => !p.collected).map(p => ({
+      id: p.id,
+      type: 'powerup',
+      x: p.x,
+      y: p.y,
+      collected: p.collected
+    })),
+    ...room.entities.hearts.filter(h => !h.collected).map(h => ({
+      id: h.id,
+      type: 'heart',
+      x: h.x,
+      y: h.y,
+      collected: h.collected
+    }))
+  ];
+}
 
+// Lấy toàn bộ trạng thái game
+function getGameState(room) {
+  return {
+    gameTimer: room.gameTimer,
+    safeRadius: room.safeRadius,
+    players: room.players.map(p => ({
+      id: p.id,
+      name: p.name,
+      x: p.x,
+      y: p.y,
+      health: p.health,
+      flowers: p.flowers,
+      isDead: p.isDead
+    })),
+    obstacles: room.entities.obstacles,
+    flowers: room.entities.flowers,
+    powerups: room.entities.powerups,
+    hearts: room.entities.hearts
+  };
+}
+
+// Gửi thông báo lỗi cho client
+function sendError(ws, message) {
+  ws.send(JSON.stringify({
+    type: 'error',
+    error: message
+  }));
+}
+
+// Gửi thông báo cho tất cả người chơi trong phòng
+function broadcastToRoom(room, message, excludeIds = []) {
+  room.players.forEach(player => {
+    if (!excludeIds.includes(player.id) && player.socket && player.socket.readyState === WebSocket.OPEN) {
+      player.socket.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Tạo mã phòng ngẫu nhiên
+function generateRoomCode() {
+  const characters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let result = '';
+  for (let i = 0; i < 6; i++) {
+    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  }
+  return result;
+}
+
+// Khởi động máy chủ
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`Máy chủ đang chạy tại cổng ${PORT}`);
 });
