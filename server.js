@@ -1,821 +1,757 @@
-const express = require('express');
-const http = require('http');
+// server.js - WebSocket server cho game Hiếu Gà - Hoa Đua Sắc
 const WebSocket = require('ws');
+const http = require('http');
+const express = require('express');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// Khởi tạo ứng dụng Express và máy chủ HTTP
+// Khởi tạo Express app và HTTP server
 const app = express();
 const server = http.createServer(app);
 
-// Khởi tạo máy chủ WebSocket
-const wss = new WebSocket.Server({ server });
+// Áp dụng middleware
+app.use(cors());
+app.use(express.json());
 
-// Đường dẫn API đơn giản để kiểm tra xem máy chủ có hoạt động không
+// Thiết lập trang chào đơn giản
 app.get('/', (req, res) => {
-  res.send('Máy chủ game Hiếu Gà đang chạy!');
+  res.send('Hiếu Gà - Hoa Đua Sắc WebSocket Server đang chạy!');
 });
 
-// Lưu trữ thông tin phòng và người chơi
-const rooms = new Map();
-const players = new Map();
+// Khởi tạo WebSocket server
+const wss = new WebSocket.Server({ server });
 
-// Hằng số game
-const GAME_DURATION = 120; // 2 phút
-const MIN_PLAYERS = 2;
-const MAX_PLAYERS = 5;
-const WORLD_SIZE = 4000; // 4000x4000 pixcel
-const SAFE_ZONE_START = 1000;
-const SAFE_ZONE_END = 300;
+// Quản lý phòng và người chơi
+const rooms = new Map(); // Lưu trữ thông tin về các phòng
+const clients = new Map(); // Lưu trữ thông tin về các kết nối websocket
 
-// Xử lý kết nối WebSocket
+// Cấu hình game
+const GAME_CONFIG = {
+  MAX_PLAYERS: 5,
+  GAME_WIDTH: 2000,
+  GAME_HEIGHT: 2000,
+  INITIAL_FLOWERS: 30,
+  INITIAL_OBSTACLES: 15,
+  SAFE_ZONE_SHRINK_INTERVAL: 20000, // 20 giây
+  DAMAGE_INTERVAL: 3000, // 3 giây
+  DAMAGE_AMOUNT: 25,
+  PLAYER_RADIUS: 25,
+  FLOWER_RADIUS: 15,
+  FLOWER_RESPAWN_TIME: 3000, // 3 giây
+  COUNTDOWN_TIME: 3 // 3 giây
+};
+
+// Xử lý kết nối mới
 wss.on('connection', (ws) => {
-  console.log('Người chơi mới đã kết nối');
+  console.log('Người dùng đã kết nối');
   
-  // Gán ID cho kết nối mới
-  ws.id = uuidv4();
+  const clientId = uuidv4();
+  clients.set(ws, { id: clientId });
   
   // Xử lý tin nhắn từ client
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
-      console.log(`Nhận tin nhắn: ${data.type} từ ${ws.id}`);
+      console.log(`Nhận tin nhắn từ ${clientId}:`, data.type);
       
-      switch (data.type) {
-        case 'register':
-          handleRegister(ws, data);
-          break;
-        case 'create_room':
+      // Xử lý các loại tin nhắn
+      switch(data.type) {
+        case 'create':
           handleCreateRoom(ws, data);
           break;
-        case 'join_room':
+        case 'join':
           handleJoinRoom(ws, data);
           break;
-        case 'leave_room':
-          handleLeaveRoom(ws);
-          break;
-        case 'toggle_ready':
-          handleToggleReady(ws, data);
-          break;
-        case 'start_game':
-          handleStartGame(ws);
+        case 'start':
+          handleStartGame(ws, data);
           break;
         case 'move':
           handlePlayerMove(ws, data);
           break;
-        case 'collect':
-          handleCollect(ws, data);
+        case 'collectFlower':
+          handleCollectFlower(ws, data);
           break;
-        case 'action':
-          handleAction(ws, data);
-          break;
-        case 'player_dead':
-          handlePlayerDead(ws);
-          break;
+        default:
+          console.warn(`Loại tin nhắn không được hỗ trợ: ${data.type}`);
       }
-    } catch (error) {
-      console.error('Lỗi xử lý tin nhắn:', error);
+    } catch (e) {
+      console.error('Lỗi khi xử lý tin nhắn:', e);
+      sendToClient(ws, {
+        type: 'error',
+        message: 'Định dạng tin nhắn không hợp lệ'
+      });
     }
   });
   
   // Xử lý ngắt kết nối
   ws.on('close', () => {
-    console.log(`Người chơi ${ws.id} đã ngắt kết nối`);
-    
-    // Xử lý người chơi rời phòng khi ngắt kết nối
-    handleLeaveRoom(ws);
-    
-    // Xóa người chơi khỏi danh sách
-    players.delete(ws.id);
+    console.log(`Người dùng ${clientId} đã ngắt kết nối`);
+    handlePlayerDisconnect(ws);
+    clients.delete(ws);
+  });
+  
+  // Xử lý lỗi kết nối
+  ws.on('error', (error) => {
+    console.error(`Lỗi kết nối với người dùng ${clientId}:`, error);
+    clients.delete(ws);
   });
 });
 
-// Xử lý đăng ký người chơi
-function handleRegister(ws, data) {
-  const playerId = data.sessionId || ws.id;
-  
-  // Lưu thông tin người chơi
-  players.set(ws.id, {
-    id: playerId,
-    name: data.name,
-    socket: ws,
-    room: null
-  });
-  
-  // Thông báo xác nhận đăng ký
-  ws.send(JSON.stringify({
-    type: 'registered',
-    playerId: playerId
-  }));
-}
-
-// Xử lý tạo phòng
+// Xử lý tạo phòng mới
 function handleCreateRoom(ws, data) {
-  const player = players.get(ws.id);
-  
-  if (!player) {
-    sendError(ws, 'Player not registered');
-    return;
-  }
-  
-  // Tạo mã phòng ngẫu nhiên
   const roomCode = generateRoomCode();
+  const playerId = data.player.id;
   
   // Tạo phòng mới
-  const room = {
-    code: roomCode,
-    host: ws.id,
-    players: [
-      {
-        id: player.id,
-        name: player.name,
-        ready: true, // Chủ phòng luôn sẵn sàng
-        socket: ws,
-        x: 0,
-        y: 0,
-        health: 100,
-        flowers: 0,
-        isDead: false
-      }
-    ],
-    gameState: 'waiting',
-    gameTimer: GAME_DURATION,
-    safeRadius: SAFE_ZONE_START,
-    entities: {
-      flowers: [],
-      powerups: [],
-      hearts: [],
-      obstacles: []
-    }
-  };
+  rooms.set(roomCode, {
+    host: playerId,
+    players: new Map([[playerId, {
+      id: playerId,
+      name: data.player.name,
+      color: data.player.color,
+      ws: ws,
+      x: 0,
+      y: 0,
+      vx: 0,
+      vy: 0,
+      health: 100,
+      flowers: 0,
+      alive: true
+    }]]),
+    started: false,
+    gameState: null,
+    intervals: []
+  });
   
-  // Lưu thông tin phòng
-  rooms.set(roomCode, room);
+  // Cập nhật thông tin client
+  const clientData = clients.get(ws);
+  clientData.roomCode = roomCode;
+  clientData.playerId = playerId;
   
-  // Cập nhật thông tin người chơi
-  player.room = roomCode;
-  
-  // Thông báo phòng đã được tạo
-  ws.send(JSON.stringify({
-    type: 'room_created',
-    roomCode: roomCode,
-    players: room.players.map(p => ({
+  // Gửi thông báo tạo phòng thành công
+  sendToClient(ws, {
+    type: 'createSuccess',
+    room: roomCode,
+    players: Array.from(rooms.get(roomCode).players.values()).map(p => ({
       id: p.id,
       name: p.name,
-      ready: p.ready
-    }))
-  }));
+      color: p.color
+    })),
+    isHost: true
+  });
+  
+  console.log(`Đã tạo phòng mới: ${roomCode}, chủ phòng: ${playerId}`);
 }
 
 // Xử lý tham gia phòng
 function handleJoinRoom(ws, data) {
-  const player = players.get(ws.id);
+  const roomCode = data.room;
+  const playerId = data.player.id;
   
-  if (!player) {
-    sendError(ws, 'Player not registered');
+  // Kiểm tra phòng có tồn tại không
+  if (!rooms.has(roomCode)) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Không tìm thấy phòng!'
+    });
     return;
   }
   
-  const roomCode = data.roomCode;
   const room = rooms.get(roomCode);
   
-  if (!room) {
-    sendError(ws, 'Room not found');
-    return;
-  }
-  
-  if (room.gameState !== 'waiting') {
-    sendError(ws, 'Game already started');
-    return;
-  }
-  
-  if (room.players.length >= MAX_PLAYERS) {
-    sendError(ws, 'Room is full');
-    return;
-  }
-  
-  // Kiểm tra xem người chơi đã ở trong phòng chưa
-  const existingPlayer = room.players.find(p => p.id === player.id);
-  if (existingPlayer) {
-    // Nếu đã ở trong phòng, cập nhật socket
-    existingPlayer.socket = ws;
-  } else {
-    // Thêm người chơi vào phòng
-    room.players.push({
-      id: player.id,
-      name: player.name,
-      ready: false,
-      socket: ws,
-      x: 0,
-      y: 0,
-      health: 100,
-      flowers: 0,
-      isDead: false
+  // Kiểm tra trò chơi đã bắt đầu chưa
+  if (room.started) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Trò chơi đã bắt đầu!'
     });
+    return;
   }
   
-  // Cập nhật thông tin người chơi
-  player.room = roomCode;
+  // Kiểm tra phòng đã đầy chưa
+  if (room.players.size >= GAME_CONFIG.MAX_PLAYERS) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Phòng đã đầy!'
+    });
+    return;
+  }
   
-  // Thông báo người chơi đã tham gia phòng
-  ws.send(JSON.stringify({
-    type: 'room_joined',
-    roomCode: roomCode,
-    players: room.players.map(p => ({
-      id: p.id,
-      name: p.name,
-      ready: p.ready
-    }))
+  // Thêm người chơi vào phòng
+  room.players.set(playerId, {
+    id: playerId,
+    name: data.player.name,
+    color: data.player.color,
+    ws: ws,
+    x: 0,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    health: 100,
+    flowers: 0,
+    alive: true
+  });
+  
+  // Cập nhật thông tin client
+  const clientData = clients.get(ws);
+  clientData.roomCode = roomCode;
+  clientData.playerId = playerId;
+  
+  // Chuyển danh sách người chơi sang định dạng để gửi đi
+  const playersList = Array.from(room.players.values()).map(p => ({
+    id: p.id,
+    name: p.name,
+    color: p.color
   }));
   
-  // Thông báo cho những người chơi khác
-  broadcastToRoom(room, {
-    type: 'player_joined',
-    players: room.players.map(p => ({
-      id: p.id,
-      name: p.name,
-      ready: p.ready
-    }))
-  }, [ws.id]);
-}
-
-// Xử lý rời phòng
-function handleLeaveRoom(ws) {
-  const player = players.get(ws.id);
+  // Gửi thông báo tham gia thành công cho người chơi mới
+  sendToClient(ws, {
+    type: 'joinSuccess',
+    room: roomCode,
+    players: playersList,
+    isHost: playerId === room.host
+  });
   
-  if (!player || !player.room) return;
-  
-  const room = rooms.get(player.room);
-  
-  if (!room) return;
-  
-  // Xóa người chơi khỏi phòng
-  const playerIndex = room.players.findIndex(p => p.id === player.id);
-  
-  if (playerIndex !== -1) {
-    room.players.splice(playerIndex, 1);
-    
-    // Thông báo cho những người chơi khác
-    broadcastToRoom(room, {
-      type: 'player_left',
-      playerId: player.id,
-      players: room.players.map(p => ({
-        id: p.id,
-        name: p.name,
-        ready: p.ready
-      }))
-    });
-    
-    // Nếu đây là chủ phòng, chuyển quyền chủ phòng cho người chơi kế tiếp
-    if (player.id === room.host && room.players.length > 0) {
-      room.host = room.players[0].id;
+  // Thông báo cho các người chơi khác trong phòng
+  broadcast(roomCode, {
+    type: 'playerJoined',
+    player: {
+      id: playerId,
+      name: data.player.name,
+      color: data.player.color
     }
-    
-    // Nếu không còn người chơi, xóa phòng
-    if (room.players.length === 0) {
-      rooms.delete(player.room);
-    }
-    
-    // Cập nhật thông tin người chơi
-    player.room = null;
-  }
-}
-
-// Xử lý chuyển trạng thái sẵn sàng
-function handleToggleReady(ws, data) {
-  const player = players.get(ws.id);
+  }, playerId);
   
-  if (!player || !player.room) return;
-  
-  const room = rooms.get(player.room);
-  
-  if (!room || room.gameState !== 'waiting') return;
-  
-  // Tìm người chơi trong phòng
-  const roomPlayer = room.players.find(p => p.id === player.id);
-  
-  if (roomPlayer) {
-    roomPlayer.ready = data.ready;
-    
-    // Thông báo cho tất cả người chơi trong phòng
-    broadcastToRoom(room, {
-      type: 'player_ready',
-      playerId: player.id,
-      ready: roomPlayer.ready,
-      players: room.players.map(p => ({
-        id: p.id,
-        name: p.name,
-        ready: p.ready
-      }))
-    });
-  }
+  console.log(`Người chơi ${playerId} đã tham gia phòng ${roomCode}`);
 }
 
 // Xử lý bắt đầu trò chơi
-function handleStartGame(ws) {
-  const player = players.get(ws.id);
+function handleStartGame(ws, data) {
+  const clientData = clients.get(ws);
+  const roomCode = clientData.roomCode;
   
-  if (!player || !player.room) return;
-  
-  const room = rooms.get(player.room);
-  
-  if (!room || room.gameState !== 'waiting') return;
-  
-  // Kiểm tra xem người gửi có phải là chủ phòng không
-  if (room.host !== player.id) {
-    sendError(ws, 'Only host can start the game');
+  if (!roomCode || !rooms.has(roomCode)) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Phòng không tồn tại'
+    });
     return;
   }
   
-  // Kiểm tra xem có đủ người chơi không
-  if (room.players.length < MIN_PLAYERS) {
-    sendError(ws, 'Not enough players');
+  const room = rooms.get(roomCode);
+  
+  // Kiểm tra người gửi có phải chủ phòng không
+  if (clientData.playerId !== room.host) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Chỉ chủ phòng mới có thể bắt đầu trò chơi'
+    });
     return;
   }
   
-  // Kiểm tra xem tất cả người chơi đã sẵn sàng chưa
-  const allReady = room.players.every(p => p.ready || p.id === room.host);
-  
-  if (!allReady) {
-    sendError(ws, 'Not all players are ready');
+  // Kiểm tra số lượng người chơi
+  if (room.players.size < 2) {
+    sendToClient(ws, {
+      type: 'error',
+      message: 'Cần ít nhất 2 người chơi để bắt đầu trò chơi'
+    });
     return;
   }
   
-  // Khởi tạo game
-  initializeGame(room);
+  // Tạo trạng thái game mới
+  room.gameState = generateGameState(room);
+  room.started = true;
   
-  // Thông báo cho tất cả người chơi trong phòng
-  broadcastToRoom(room, {
-    type: 'game_starting',
-    gameState: getGameState(room)
+  // Thiết lập vị trí ban đầu cho mỗi người chơi
+  setupPlayerPositions(room);
+  
+  // Gửi thông báo bắt đầu trò chơi cho tất cả người chơi
+  broadcastToAll(roomCode, {
+    type: 'gameStart',
+    map: {
+      width: GAME_CONFIG.GAME_WIDTH,
+      height: GAME_CONFIG.GAME_HEIGHT,
+      flowers: room.gameState.flowers,
+      obstacles: room.gameState.obstacles,
+      safeZone: room.gameState.safeZone,
+      playerPositions: room.gameState.playerPositions
+    },
+    countdown: GAME_CONFIG.COUNTDOWN_TIME
   });
   
-  // Bắt đầu trò chơi
-  room.gameState = 'playing';
+  console.log(`Trò chơi đã bắt đầu trong phòng ${roomCode}`);
   
-  // Bắt đầu bộ đếm thời gian
-  startGameTimer(room);
-}
-
-// Khởi tạo trò chơi
-function initializeGame(room) {
-  // Đặt lại thời gian
-  room.gameTimer = GAME_DURATION;
-  room.safeRadius = SAFE_ZONE_START;
-  
-  // Đặt vị trí cho người chơi
-  room.players.forEach((player, index) => {
-    const angle = (index / room.players.length) * Math.PI * 2;
-    player.x = Math.cos(angle) * 300;
-    player.y = Math.sin(angle) * 300;
-    player.health = 100;
-    player.flowers = 0;
-    player.isDead = false;
-  });
-  
-  // Tạo các đối tượng trong game
-  generateObstacles(room);
-  generateCollectibles(room);
-}
-
-// Tạo các chướng ngại vật
-function generateObstacles(room) {
-  room.entities.obstacles = [];
-  
-  // Tạo 40 chướng ngại vật ngẫu nhiên
-  for (let i = 0; i < 40; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const distance = Math.random() * 900 + 100;
-    const x = Math.cos(angle) * distance;
-    const y = Math.sin(angle) * distance;
-    
-    const types = ['tree', 'bush', 'rock'];
-    const type = types[Math.floor(Math.random() * types.length)];
-    
-    room.entities.obstacles.push({
-      id: `obstacle_${i}`,
-      x,
-      y,
-      type
-    });
-  }
-}
-
-// Tạo các vật phẩm có thể thu thập
-function generateCollectibles(room) {
-  room.entities.flowers = [];
-  room.entities.powerups = [];
-  room.entities.hearts = [];
-  
-  // Tạo 100 bông hoa
-  for (let i = 0; i < 100; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const distance = Math.random() * 900 + 100;
-    const x = Math.cos(angle) * distance;
-    const y = Math.sin(angle) * distance;
-    
-    room.entities.flowers.push({
-      id: `flower_${i}`,
-      x,
-      y,
-      collected: false
-    });
-  }
-  
-  // Tạo 10 powerup
-  for (let i = 0; i < 10; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const distance = Math.random() * 800 + 200;
-    const x = Math.cos(angle) * distance;
-    const y = Math.sin(angle) * distance;
-    
-    room.entities.powerups.push({
-      id: `powerup_${i}`,
-      x,
-      y,
-      collected: false
-    });
-  }
-  
-  // Tạo 5 trái tim
-  for (let i = 0; i < 5; i++) {
-    const angle = Math.random() * Math.PI * 2;
-    const distance = Math.random() * 800 + 200;
-    const x = Math.cos(angle) * distance;
-    const y = Math.sin(angle) * distance;
-    
-    room.entities.hearts.push({
-      id: `heart_${i}`,
-      x,
-      y,
-      collected: false
-    });
-  }
-}
-
-// Bắt đầu bộ đếm thời gian
-function startGameTimer(room) {
-  const gameInterval = setInterval(() => {
-    if (!rooms.has(room.code) || room.gameState !== 'playing') {
-      clearInterval(gameInterval);
-      return;
-    }
-    
-    // Giảm thời gian
-    room.gameTimer--;
-    
-    // Thu nhỏ vùng an toàn
-    room.safeRadius = Math.max(SAFE_ZONE_END, SAFE_ZONE_START - (SAFE_ZONE_START - SAFE_ZONE_END) * (1 - room.gameTimer / GAME_DURATION));
-    
-    // Thỉnh thoảng tạo thêm bông hoa mới
-    if (Math.random() < 0.05) {
-      const angle = Math.random() * Math.PI * 2;
-      const distance = Math.random() * room.safeRadius * 0.8;
-      const x = Math.cos(angle) * distance;
-      const y = Math.sin(angle) * distance;
-      
-      const flowerId = `flower_new_${Date.now()}`;
-      
-      room.entities.flowers.push({
-        id: flowerId,
-        x,
-        y,
-        collected: false
-      });
-    }
-    
-    // Gửi cập nhật trạng thái game
-    broadcastGameState(room);
-    
-    // Kiểm tra kết thúc game
-    if (room.gameTimer <= 0 || isGameOver(room)) {
-      endGame(room);
-      clearInterval(gameInterval);
-    }
-  }, 1000);
-}
-
-// Kiểm tra xem trò chơi đã kết thúc chưa
-function isGameOver(room) {
-  // Đếm số người chơi còn sống
-  const alivePlayers = room.players.filter(p => !p.isDead);
-  
-  // Trò chơi kết thúc khi chỉ còn 1 người chơi hoặc tất cả đều chết
-  return alivePlayers.length <= 1;
-}
-
-// Kết thúc trò chơi
-function endGame(room) {
-  room.gameState = 'ended';
-  
-  // Sắp xếp người chơi theo số hoa đã thu thập
-  const winners = [...room.players]
-    .filter(p => !p.isDead)
-    .sort((a, b) => b.flowers - a.flowers);
-  
-  // Thông báo kết quả cho tất cả người chơi
-  broadcastToRoom(room, {
-    type: 'game_over',
-    winners: winners.map(p => ({
-      id: p.id,
-      name: p.name,
-      flowers: p.flowers
-    }))
-  });
-  
-  // Đặt lại phòng sau một khoảng thời gian
-  setTimeout(() => {
-    if (rooms.has(room.code)) {
-      room.gameState = 'waiting';
-      room.gameTimer = GAME_DURATION;
-      room.safeRadius = SAFE_ZONE_START;
-      
-      // Đặt lại người chơi
-      room.players.forEach(p => {
-        p.ready = p.id === room.host;
-        p.health = 100;
-        p.flowers = 0;
-        p.isDead = false;
-      });
-    }
-  }, 10000);
+  // Bắt đầu chu kỳ game
+  scheduleSafeZoneShrink(roomCode);
 }
 
 // Xử lý di chuyển người chơi
 function handlePlayerMove(ws, data) {
-  const player = players.get(ws.id);
+  const clientData = clients.get(ws);
+  const roomCode = clientData.roomCode;
   
-  if (!player || !player.room) return;
+  if (!roomCode || !rooms.has(roomCode)) return;
   
-  const room = rooms.get(player.room);
+  const room = rooms.get(roomCode);
   
-  if (!room || room.gameState !== 'playing') return;
+  if (!room.started) return;
   
-  // Tìm người chơi trong phòng
-  const roomPlayer = room.players.find(p => p.id === player.id);
+  const playerId = data.player.id;
+  const player = room.players.get(playerId);
   
-  if (roomPlayer && !roomPlayer.isDead) {
-    // Cập nhật vị trí người chơi
-    roomPlayer.x += data.vx;
-    roomPlayer.y += data.vy;
-    
-    // Kiểm tra va chạm với chướng ngại vật
-    room.entities.obstacles.forEach(obstacle => {
-      const dx = roomPlayer.x - obstacle.x;
-      const dy = roomPlayer.y - obstacle.y;
-      const distance = Math.sqrt(dx * dx + dy * dy);
-      
-      if (distance < 40) {
-        // Đẩy người chơi ra xa chướng ngại vật
-        const pushFactor = 1;
-        roomPlayer.x += (dx / distance) * pushFactor;
-        roomPlayer.y += (dy / distance) * pushFactor;
-      }
-    });
-    
-    // Kiểm tra xem người chơi có ở ngoài vùng an toàn không
-    const distanceFromCenter = Math.sqrt(roomPlayer.x * roomPlayer.x + roomPlayer.y * roomPlayer.y);
-    
-    if (distanceFromCenter > room.safeRadius) {
-      // Người chơi nhận sát thương khi ở ngoài vùng an toàn
-      roomPlayer.health -= 0.5;
-      
-      // Kiểm tra xem người chơi có chết không
-      if (roomPlayer.health <= 0) {
-        roomPlayer.isDead = true;
-      }
-    }
-  }
+  if (!player || !player.alive) return;
+  
+  // Cập nhật vị trí người chơi
+  player.x = data.x;
+  player.y = data.y;
+  player.vx = data.vx;
+  player.vy = data.vy;
+  
+  // Truyền dữ liệu di chuyển cho tất cả người chơi
+  broadcastToAll(roomCode, {
+    type: 'playerMove',
+    playerId: playerId,
+    x: player.x,
+    y: player.y,
+    vx: player.vx,
+    vy: player.vy
+  });
 }
 
-// Xử lý thu thập vật phẩm
-function handleCollect(ws, data) {
-  const player = players.get(ws.id);
+// Xử lý thu thập hoa
+function handleCollectFlower(ws, data) {
+  const clientData = clients.get(ws);
+  const roomCode = clientData.roomCode;
   
-  if (!player || !player.room) return;
+  if (!roomCode || !rooms.has(roomCode)) return;
   
-  const room = rooms.get(player.room);
+  const room = rooms.get(roomCode);
   
-  if (!room || room.gameState !== 'playing') return;
+  if (!room.started) return;
   
-  // Tìm người chơi trong phòng
-  const roomPlayer = room.players.find(p => p.id === player.id);
+  const playerId = data.playerId;
+  const flowerIndex = data.flowerIndex;
+  const player = room.players.get(playerId);
   
-  if (!roomPlayer || roomPlayer.isDead) return;
+  if (!player || !player.alive) return;
   
-  // Tìm vật phẩm
-  let item;
-  let items;
-  
-  if (data.itemType === 'flower') {
-    items = room.entities.flowers;
-  } else if (data.itemType === 'powerup') {
-    items = room.entities.powerups;
-  } else if (data.itemType === 'heart') {
-    items = room.entities.hearts;
-  } else {
-    return;
-  }
-  
-  item = items.find(i => i.id === data.itemId && !i.collected);
-  
-  if (!item) return;
-  
-  // Kiểm tra khoảng cách
-  const dx = roomPlayer.x - item.x;
-  const dy = roomPlayer.y - item.y;
-  const distance = Math.sqrt(dx * dx + dy * dy);
-  
-  if (distance < 30) {
-    // Thu thập vật phẩm
-    item.collected = true;
+  // Kiểm tra hoa có tồn tại không
+  if (flowerIndex >= 0 && flowerIndex < room.gameState.flowers.length && room.gameState.flowers[flowerIndex]) {
+    // Tăng số hoa đã thu thập
+    player.flowers += 1;
     
-    // Áp dụng hiệu ứng của vật phẩm
-    if (data.itemType === 'flower') {
-      roomPlayer.flowers += 1;
-    } else if (data.itemType === 'heart') {
-      roomPlayer.health = Math.min(100, roomPlayer.health + 30);
-    }
-    
-    // Thông báo cho tất cả người chơi
-    broadcastToRoom(room, {
-      type: 'item_collected',
-      itemType: data.itemType,
-      itemId: data.itemId,
-      playerId: player.id
+    // Thông báo hoa đã được thu thập
+    broadcastToAll(roomCode, {
+      type: 'flowerCollected',
+      playerId: playerId,
+      flowerIndex: flowerIndex,
+      flowerCount: player.flowers
     });
-  }
-}
-
-// Xử lý hành động người chơi
-function handleAction(ws, data) {
-  const player = players.get(ws.id);
-  
-  if (!player || !player.room) return;
-  
-  const room = rooms.get(player.room);
-  
-  if (!room || room.gameState !== 'playing') return;
-  
-  // Tìm người chơi trong phòng
-  const roomPlayer = room.players.find(p => p.id === player.id);
-  
-  if (!roomPlayer || roomPlayer.isDead) return;
-  
-  if (data.action === 'collect_flower') {
-    // Thu thập tất cả hoa ở gần
-    let collected = false;
     
-    room.entities.flowers.forEach(flower => {
-      if (!flower.collected) {
-        const dx = roomPlayer.x - flower.x;
-        const dy = roomPlayer.y - flower.y;
-        const distance = Math.sqrt(dx * dx + dy * dy);
+    // Đánh dấu hoa đã bị thu thập
+    room.gameState.flowers[flowerIndex] = null;
+    
+    // Tạo hoa mới sau một khoảng thời gian
+    setTimeout(() => {
+      if (room.started && rooms.has(roomCode)) {
+        const newFlower = generateRandomFlower(room.gameState.safeZone.x, room.gameState.safeZone.y, room.gameState.safeZone.radius);
+        room.gameState.flowers[flowerIndex] = newFlower;
         
-        if (distance < 100) {
-          flower.collected = true;
-          roomPlayer.flowers += 1;
-          collected = true;
+        broadcastToAll(roomCode, {
+          type: 'newFlower',
+          flower: newFlower,
+          index: flowerIndex
+        });
+      }
+    }, GAME_CONFIG.FLOWER_RESPAWN_TIME);
+  }
+}
+
+// Xử lý người chơi ngắt kết nối
+function handlePlayerDisconnect(ws) {
+  const clientData = clients.get(ws);
+  if (!clientData || !clientData.roomCode) return;
+  
+  const roomCode = clientData.roomCode;
+  const playerId = clientData.playerId;
+  
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  
+  // Xóa người chơi khỏi phòng
+  room.players.delete(playerId);
+  
+  // Thông báo cho các người chơi khác
+  broadcastToAll(roomCode, {
+    type: 'playerLeft',
+    playerId: playerId
+  });
+  
+  // Nếu là chủ phòng, chuyển quyền cho người chơi khác
+  if (playerId === room.host && room.players.size > 0) {
+    const newHost = room.players.keys().next().value;
+    room.host = newHost;
+    
+    // Thông báo chủ phòng mới
+    broadcastToAll(roomCode, {
+      type: 'newHost',
+      playerId: newHost
+    });
+  }
+  
+  // Nếu đang chơi và người chơi còn sống, đánh dấu là đã loại
+  if (room.started && room.gameState && room.gameState.playerStatus) {
+    if (room.gameState.playerStatus[playerId] && room.gameState.playerStatus[playerId].alive) {
+      room.gameState.playerStatus[playerId].alive = false;
+      
+      broadcastToAll(roomCode, {
+        type: 'playerEliminated',
+        playerId: playerId
+      });
+      
+      // Kiểm tra điều kiện kết thúc game
+      checkGameEnd(roomCode);
+    }
+  }
+  
+  // Xóa phòng nếu không còn người chơi
+  if (room.players.size === 0) {
+    cleanupRoom(roomCode);
+  }
+}
+
+// Lên lịch thu hẹp vùng an toàn
+function scheduleSafeZoneShrink(roomCode) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  
+  const intervalId = setInterval(() => {
+    if (!rooms.has(roomCode) || !room.started) {
+      clearInterval(intervalId);
+      return;
+    }
+    
+    // Cập nhật vùng an toàn
+    const currentRadius = room.gameState.safeZone.radius;
+    const nextRadius = room.gameState.safeZone.nextRadius;
+    
+    room.gameState.safeZone.radius = nextRadius;
+    room.gameState.safeZone.nextRadius = Math.max(150, nextRadius * 0.7);
+    
+    // Thông báo cập nhật vùng an toàn
+    broadcastToAll(roomCode, {
+      type: 'updateSafeZone',
+      safeZone: room.gameState.safeZone
+    });
+    
+    // Bắt đầu gây sát thương cho người chơi ngoài vùng an toàn
+    scheduleOutOfZoneDamage(roomCode);
+    
+    // Nếu vùng an toàn đã đủ nhỏ, dừng thu hẹp
+    if (room.gameState.safeZone.nextRadius <= 150) {
+      clearInterval(intervalId);
+      
+      // Sau một thời gian, kết thúc trò chơi nếu vẫn còn quá nhiều người
+      setTimeout(() => {
+        if (rooms.has(roomCode) && room.started) {
+          const alivePlayers = getAlivePlayers(room);
+          if (alivePlayers.length > 3) {
+            // Sắp xếp người chơi theo số hoa thu thập được
+            const sortedPlayers = alivePlayers.sort((a, b) => b.flowers - a.flowers);
+            // Chỉ giữ lại top 3
+            const winners = sortedPlayers.slice(0, 3);
+            
+            // Kết thúc trò chơi
+            endGame(roomCode, winners);
+          }
+        }
+      }, 30000); // 30 giây sau khi vùng an toàn đạt kích thước tối thiểu
+    }
+  }, GAME_CONFIG.SAFE_ZONE_SHRINK_INTERVAL);
+  
+  // Lưu intervalId để dọn dẹp sau này
+  room.intervals.push(intervalId);
+}
+
+// Lên lịch gây sát thương cho người chơi ngoài vùng an toàn
+function scheduleOutOfZoneDamage(roomCode) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  
+  const intervalId = setInterval(() => {
+    if (!rooms.has(roomCode) || !room.started) {
+      clearInterval(intervalId);
+      return;
+    }
+    
+    // Kiểm tra từng người chơi
+    room.players.forEach(player => {
+      if (!player.alive) return;
+      
+      // Tính khoảng cách đến trung tâm vùng an toàn
+      const distance = Math.sqrt(
+        Math.pow(player.x - room.gameState.safeZone.x, 2) +
+        Math.pow(player.y - room.gameState.safeZone.y, 2)
+      );
+      
+      // Nếu ngoài vùng an toàn, gây sát thương
+      if (distance > room.gameState.safeZone.radius) {
+        player.health -= GAME_CONFIG.DAMAGE_AMOUNT;
+        
+        // Thông báo người chơi bị sát thương
+        broadcastToAll(roomCode, {
+          type: 'playerHit',
+          playerId: player.id,
+          damage: GAME_CONFIG.DAMAGE_AMOUNT
+        });
+        
+        // Nếu máu về 0, loại người chơi
+        if (player.health <= 0) {
+          player.health = 0;
+          player.alive = false;
           
-          // Thông báo cho tất cả người chơi
-          broadcastToRoom(room, {
-            type: 'item_collected',
-            itemType: 'flower',
-            itemId: flower.id,
+          // Thông báo người chơi bị loại
+          broadcastToAll(roomCode, {
+            type: 'playerEliminated',
             playerId: player.id
           });
+          
+          // Kiểm tra điều kiện kết thúc game
+          checkGameEnd(roomCode);
         }
       }
     });
+  }, GAME_CONFIG.DAMAGE_INTERVAL);
+  
+  // Lưu intervalId để dọn dẹp sau này
+  room.intervals.push(intervalId);
+}
+
+// Kiểm tra điều kiện kết thúc game
+function checkGameEnd(roomCode) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  
+  // Đếm số người chơi còn sống
+  const alivePlayers = getAlivePlayers(room);
+  
+  // Nếu chỉ còn <= 3 người chơi, kết thúc trò chơi
+  if (alivePlayers.length <= 3 && alivePlayers.length > 0) {
+    endGame(roomCode, alivePlayers);
   }
 }
 
-// Xử lý người chơi chết
-function handlePlayerDead(ws) {
-  const player = players.get(ws.id);
+// Kết thúc trò chơi
+function endGame(roomCode, winners) {
+  if (!rooms.has(roomCode)) return;
   
-  if (!player || !player.room) return;
+  const room = rooms.get(roomCode);
+  room.started = false;
   
-  const room = rooms.get(player.room);
-  
-  if (!room || room.gameState !== 'playing') return;
-  
-  // Tìm người chơi trong phòng
-  const roomPlayer = room.players.find(p => p.id === player.id);
-  
-  if (!roomPlayer) return;
-  
-  // Đánh dấu người chơi đã chết
-  roomPlayer.isDead = true;
-  
-  // Thông báo cho tất cả người chơi
-  broadcastToRoom(room, {
-    type: 'player_dead',
-    playerId: player.id
-  });
-  
-  // Kiểm tra xem trò chơi đã kết thúc chưa
-  if (isGameOver(room)) {
-    endGame(room);
+  // Dọn dẹp các interval
+  for (const intervalId of room.intervals) {
+    clearInterval(intervalId);
   }
-}
-
-// Gửi cập nhật trạng thái game cho tất cả người chơi trong phòng
-function broadcastGameState(room) {
-  broadcastToRoom(room, {
-    type: 'game_state',
-    gameTimer: room.gameTimer,
-    safeRadius: room.safeRadius,
-    players: room.players.map(p => ({
+  room.intervals = [];
+  
+  // Sắp xếp người thắng theo số hoa thu thập được
+  const sortedWinners = winners.sort((a, b) => b.flowers - a.flowers);
+  
+  // Gửi thông báo kết thúc trò chơi
+  broadcastToAll(roomCode, {
+    type: 'gameOver',
+    winners: sortedWinners.map(p => ({
       id: p.id,
       name: p.name,
-      x: p.x,
-      y: p.y,
-      health: p.health,
-      flowers: p.flowers,
-      isDead: p.isDead
-    })),
-    entities: getEntitiesUpdate(room)
-  });
-}
-
-// Lấy cập nhật về các đối tượng trong game
-function getEntitiesUpdate(room) {
-  return [
-    ...room.entities.flowers.filter(f => !f.collected).map(f => ({
-      id: f.id,
-      type: 'flower',
-      x: f.x,
-      y: f.y,
-      collected: f.collected
-    })),
-    ...room.entities.powerups.filter(p => !p.collected).map(p => ({
-      id: p.id,
-      type: 'powerup',
-      x: p.x,
-      y: p.y,
-      collected: p.collected
-    })),
-    ...room.entities.hearts.filter(h => !h.collected).map(h => ({
-      id: h.id,
-      type: 'heart',
-      x: h.x,
-      y: h.y,
-      collected: h.collected
+      color: p.color,
+      flowers: p.flowers
     }))
-  ];
+  });
+  
+  console.log(`Trò chơi kết thúc trong phòng ${roomCode}`);
 }
 
-// Lấy toàn bộ trạng thái game
-function getGameState(room) {
+// Dọn dẹp phòng
+function cleanupRoom(roomCode) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  
+  // Dọn dẹp các interval
+  for (const intervalId of room.intervals) {
+    clearInterval(intervalId);
+  }
+  
+  // Xóa phòng khỏi danh sách
+  rooms.delete(roomCode);
+  
+  console.log(`Đã xóa phòng ${roomCode}`);
+}
+
+// Lấy danh sách người chơi còn sống
+function getAlivePlayers(room) {
+  return Array.from(room.players.values()).filter(p => p.alive);
+}
+
+// Thiết lập vị trí người chơi ban đầu
+function setupPlayerPositions(room) {
+  const playerPositions = {};
+  const centerX = GAME_CONFIG.GAME_WIDTH / 2;
+  const centerY = GAME_CONFIG.GAME_HEIGHT / 2;
+  const radius = 200; // Khoảng cách từ trung tâm
+  
+  // Phân bố người chơi theo hình tròn quanh trung tâm
+  let index = 0;
+  const totalPlayers = room.players.size;
+  
+  room.players.forEach(player => {
+    const angle = (index / totalPlayers) * Math.PI * 2;
+    const x = centerX + Math.cos(angle) * radius;
+    const y = centerY + Math.sin(angle) * radius;
+    
+    player.x = x;
+    player.y = y;
+    player.vx = 0;
+    player.vy = 0;
+    
+    playerPositions[player.id] = { x, y };
+    index++;
+  });
+  
+  room.gameState.playerPositions = playerPositions;
+}
+
+// Tạo trạng thái trò chơi mới
+function generateGameState(room) {
+  const width = GAME_CONFIG.GAME_WIDTH;
+  const height = GAME_CONFIG.GAME_HEIGHT;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  
+  // Tạo hoa
+  const flowers = [];
+  for (let i = 0; i < GAME_CONFIG.INITIAL_FLOWERS; i++) {
+    flowers.push(generateRandomFlower(centerX, centerY, width / 2 - 100));
+  }
+  
+  // Tạo chướng ngại vật
+  const obstacles = [];
+  for (let i = 0; i < GAME_CONFIG.INITIAL_OBSTACLES; i++) {
+    obstacles.push({
+      x: centerX + (Math.random() * width / 2 - width / 4),
+      y: centerY + (Math.random() * height / 2 - height / 4),
+      radius: Math.random() * 30 + 20
+    });
+  }
+  
+  // Thiết lập vùng an toàn
+  const safeZone = {
+    x: centerX,
+    y: centerY,
+    radius: width / 2,
+    nextRadius: width / 2.5
+  };
+  
   return {
-    gameTimer: room.gameTimer,
-    safeRadius: room.safeRadius,
-    players: room.players.map(p => ({
-      id: p.id,
-      name: p.name,
-      x: p.x,
-      y: p.y,
-      health: p.health,
-      flowers: p.flowers,
-      isDead: p.isDead
-    })),
-    obstacles: room.entities.obstacles,
-    flowers: room.entities.flowers,
-    powerups: room.entities.powerups,
-    hearts: room.entities.hearts
+    flowers,
+    obstacles,
+    safeZone,
+    playerPositions: {},
+    startTime: Date.now()
   };
 }
 
-// Gửi thông báo lỗi cho client
-function sendError(ws, message) {
-  ws.send(JSON.stringify({
-    type: 'error',
-    error: message
-  }));
-}
-
-// Gửi thông báo cho tất cả người chơi trong phòng
-function broadcastToRoom(room, message, excludeIds = []) {
-  room.players.forEach(player => {
-    if (!excludeIds.includes(player.id) && player.socket && player.socket.readyState === WebSocket.OPEN) {
-      player.socket.send(JSON.stringify(message));
-    }
-  });
+// Tạo hoa ngẫu nhiên
+function generateRandomFlower(centerX, centerY, radius) {
+  // Tạo vị trí ngẫu nhiên trong vùng an toàn
+  const angle = Math.random() * Math.PI * 2;
+  const distance = Math.random() * radius * 0.8; // 80% bán kính để đảm bảo nằm trong vùng an toàn
+  
+  return {
+    x: centerX + Math.cos(angle) * distance,
+    y: centerY + Math.sin(angle) * distance,
+    type: Math.floor(Math.random() * 3) // 3 loại hoa khác nhau
+  };
 }
 
 // Tạo mã phòng ngẫu nhiên
 function generateRoomCode() {
-  const characters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let result = '';
-  for (let i = 0; i < 6; i++) {
-    result += characters.charAt(Math.floor(Math.random() * characters.length));
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Bỏ các ký tự dễ nhầm lẫn
+  let code = '';
+  for (let i = 0; i < 5; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  return result;
+  return code;
 }
 
-// Khởi động máy chủ
+// Gửi tin nhắn đến một client
+function sendToClient(ws, message) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+// Phát tin nhắn đến tất cả người chơi trong phòng trừ người gửi
+function broadcast(roomCode, message, excludePlayerId = null) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  room.players.forEach(player => {
+    if (player.id !== excludePlayerId && player.ws.readyState === WebSocket.OPEN) {
+      player.ws.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Phát tin nhắn đến tất cả người chơi trong phòng
+function broadcastToAll(roomCode, message) {
+  if (!rooms.has(roomCode)) return;
+  
+  const room = rooms.get(roomCode);
+  room.players.forEach(player => {
+    if (player.ws.readyState === WebSocket.OPEN) {
+      player.ws.send(JSON.stringify(message));
+    }
+  });
+}
+
+// Thiết lập ping để giữ kết nối
+setInterval(() => {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.ping();
+    }
+  });
+}, 30000);
+
+// Khởi động server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Máy chủ đang chạy tại cổng ${PORT}`);
+  console.log(`Server đang chạy tại port ${PORT}`);
+});
+
+// Xử lý khi server đóng
+process.on('SIGINT', () => {
+  console.log('Đang đóng server...');
+  
+  // Đóng tất cả các kết nối
+  wss.clients.forEach(client => {
+    client.close();
+  });
+  
+  // Dọn dẹp tất cả các phòng
+  rooms.forEach((room, roomCode) => {
+    cleanupRoom(roomCode);
+  });
+  
+  // Đóng server
+  server.close(() => {
+    console.log('Server đã đóng');
+    process.exit(0);
+  });
 });
